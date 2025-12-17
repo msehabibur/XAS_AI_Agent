@@ -5,4 +5,4 @@ scipy
 openai
 matplotlib
 ase 
-st-py3mol
+py3mol
