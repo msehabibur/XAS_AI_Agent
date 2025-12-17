@@ -1,112 +1,146 @@
-import streamlit as st
-import pandas as pd
+import os
+import re
+import random
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
+import streamlit as st
+import openai
+from ase.io import read
+from st_py3mol import showmol
+import py3mol
+from scipy.signal import find_peaks
 from scipy.optimize import curve_fit
-from openai import OpenAI
 
-# --- 1. CONFIGURATION ---
-st.set_page_config(page_title="Dr. XAS AI Agent", layout="wide")
-
-# Sidebar for Logo and API
-with st.sidebar:
+# -----------------------------
+# 1. CORE XAS MATH UTILITIES
+# -----------------------------
+def load_spectrum(path: str):
     try:
-        st.image("drxas_logo_big.png", use_container_width=True)
+        df = pd.read_csv(path)
+        # Simplified column inference for brevity
+        x = pd.to_numeric(df.iloc[:, 0], errors="coerce").to_numpy()
+        y = pd.to_numeric(df.iloc[:, 1], errors="coerce").to_numpy()
+        m = np.isfinite(x) & np.isfinite(y)
+        return x[m].astype(float), y[m].astype(float)
     except:
-        st.warning("Logo file 'drxas_logo_big.png' not found.")
+        arr = np.loadtxt(path)
+        return arr[:, 0], arr[:, 1]
+
+def compute_fft(x, y, n=2048):
+    xu = np.linspace(np.min(x), np.max(x), n)
+    yu = np.interp(xu, x, y)
+    yu -= np.mean(yu)
+    w = np.hanning(len(yu))
+    Y = np.fft.rfft(yu * w)
+    freq = np.fft.rfftfreq(len(yu), d=(xu[1] - xu[0]))
+    return xu, yu, freq, np.abs(Y)
+
+# -----------------------------
+# 2. LLM AGENT INTERFACE
+# -----------------------------
+def ask_dr_xas(user_prompt, api_key, context_data):
+    if not api_key:
+        return "Please provide an OpenAI API Key in the sidebar to use the AI Assistant."
     
-    st.title("Control Panel")
-    api_key = st.text_input("OpenAI API Key", type="password")
-    client = OpenAI(api_key=api_key) if api_key else None
+    client = openai.OpenAI(api_key=api_key)
+    system_msg = (
+        "You are Dr. XAS, an expert in X-ray Absorption Spectroscopy. "
+        "Analyze the user's data (peaks, structural clusters, FFT) with scientific rigor. "
+        "Context: " + str(context_data)
+    )
+    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4-turbo",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error contacting GPT: {str(e)}"
+
+# -----------------------------
+# 3. UI LAYOUT & SIDEBAR
+# -----------------------------
+st.set_page_config(page_title="Dr. XAS AI Agent", layout="wide")
+st.title("🧪 Dr. XAS: Advanced Spectroscopy & Cluster Analysis")
+
+with st.sidebar:
+    st.header("Settings & API")
+    openai_key = st.text_input("OpenAI API Key", type="password", help="Enter your sk-... key")
     
     st.divider()
-    st.write("**Database Status:**")
-    try:
-        # Assuming your CSV has columns 'energy' and 'intensity'
-        df = pd.read_csv("XAS_database.txt")
-        st.success("xas_data.csv loaded successfully!")
-    except FileNotFoundError:
-        st.error("xas_data.csv not found. Using dummy data for now.")
-        x = np.linspace(7000, 7200, 500)
-        y = np.exp(-(x - 7120)**2 / 40) + 0.5 * np.exp(-(x - 7150)**2 / 100) + 0.1 * np.random.normal(size=500)
-        df = pd.DataFrame({"energy": x, "intensity": y})
+    data_folder = st.text_input("Spectra folder", value="data")
+    cif_folder = st.text_input("CIF folder", value="cif_files")
+    
+    if st.button("🔄 Scan & Load Random"):
+        if os.path.isdir(data_folder):
+            files = [os.path.join(data_folder, f) for f in os.listdir(data_folder) if f.endswith(('.csv', '.txt'))]
+            if files:
+                path = random.choice(files)
+                st.session_state.x, st.session_state.y = load_spectrum(path)
+                st.session_state.current_path = path
 
-# --- 2. MATH FUNCTIONS ---
-def gaussian(x, amp, cen, wid):
-    return amp * np.exp(-(x - cen)**2 / (2 * wid**2))
+# -----------------------------
+# 4. MAIN DASHBOARD
+# -----------------------------
+col1, col2 = st.columns([1, 1])
 
-def perform_fit(x, y):
-    # Initial guess: max height, x-coord of max height, and a standard width
-    peak_idx = np.argmax(y)
-    p0 = [max(y), x[peak_idx], 1.0]
-    popt, _ = curve_fit(gaussian, x, y, p0=p0)
-    return popt
+with col1:
+    st.subheader("Spectrum & FFT")
+    if "x" in st.session_state:
+        # Plot Raw
+        df_plot = pd.DataFrame({"Energy": st.session_state.x, "Mu": st.session_state.y})
+        st.line_chart(df_plot, x="Energy", y="Mu", height=250)
+        
+        # Auto-compute FFT
+        xu, yu, freq, mag = compute_fft(st.session_state.x, st.session_state.y)
+        st.write("**Fourier Transform (R-space equivalent)**")
+        fft_df = pd.DataFrame({"Freq": freq, "Magnitude": mag})
+        st.line_chart(fft_df, x="Freq", y="Magnitude", height=250)
+    else:
+        st.info("Load a spectrum from the sidebar.")
 
-# --- 3. CHAT INTERFACE & MEMORY ---
+with col2:
+    st.subheader("Cluster Structure (CIF)")
+    if os.path.exists(cif_folder):
+        cifs = [f for f in os.listdir(cif_folder) if f.endswith(".cif")]
+        if cifs:
+            atoms = read(os.path.join(cif_folder, cifs[0]))
+            # 3D Render
+            view = py3mol.view(width=400, height=400)
+            view.addModel(atoms.get_positions().tolist(), 'xyz') # Simplified for demo
+            view.setStyle({'sphere': {'scale': 0.3}, 'stick': {'radius': 0.1}})
+            showmol(view, height=400, width=400)
+            st.write(f"**Formula:** {atoms.get_chemical_formula()}")
+
+# -----------------------------
+# 5. INTEGRATED CHAT
+# -----------------------------
+st.divider()
+st.subheader("💬 Chat with Dr. XAS")
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-st.title("Dr. XAS AI Agent")
-
-# Display historical messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-        if "plot" in message:
-            st.pyplot(message["plot"])
 
-# User prompt
-if prompt := st.chat_input("How can I help with your XAS data?"):
+if prompt := st.chat_input("Ask about the peaks or the local coordination environment..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    if not client:
-        st.error("Please enter your OpenAI API Key in the sidebar to proceed.")
-    else:
-        with st.chat_message("assistant"):
-            low_prompt = prompt.lower()
-            fig, ax = plt.subplots(figsize=(8, 4))
-            
-            # TASK: GAUSSIAN FITTING
-            if "fit" in low_prompt or "gaussian" in low_prompt:
-                x_val, y_val = df["energy"].values, df["intensity"].values
-                popt = perform_fit(x_val, y_val)
-                
-                ax.plot(x_val, y_val, 'k-', label='Original Data', alpha=0.7)
-                ax.plot(x_val, gaussian(x_val, *popt), 'r--', label='Gaussian Fit')
-                ax.set_title("XAS Peak Fitting")
-                ax.set_xlabel("Energy (eV)")
-                ax.set_ylabel("Intensity")
-                ax.legend()
-                st.pyplot(fig)
-                
-                res_text = (f"I've performed a Gaussian fit on the primary peak.\n\n"
-                            f"**Parameters:**\n- Position: {popt[1]:.2f}\n- Amplitude: {popt[0]:.2f}\n- Width: {popt[2]:.2f}")
-                st.markdown(res_text)
-                st.session_state.messages.append({"role": "assistant", "content": res_text, "plot": fig})
-
-            # TASK: FOURIER TRANSFORM
-            elif "fourier" in low_prompt or "transform" in low_prompt:
-                y_val = df["intensity"].values
-                fft_res = np.abs(np.fft.fft(y_val))[:len(y_val)//2]
-                
-                ax.plot(fft_res, color='blue')
-                ax.set_title("Fourier Transform (R-space Magnitude)")
-                ax.set_xlabel("k (approx)")
-                ax.set_ylabel("|FT|")
-                st.pyplot(fig)
-                
-                res_text = "Fourier Transform complete. The plot above shows the magnitude in R-space."
-                st.markdown(res_text)
-                st.session_state.messages.append({"role": "assistant", "content": res_text, "plot": fig})
-
-            # TASK: GENERAL CHAT (Memory included)
-            else:
-                response = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
-                )
-                res_text = response.choices[0].message.content
-                st.markdown(res_text)
-                st.session_state.messages.append({"role": "assistant", "content": res_text})
+    # Prepare context for GPT
+    context = {
+        "spectrum_file": st.session_state.get("current_path", "None"),
+        "formula": atoms.get_chemical_formula() if 'atoms' in locals() else "Unknown"
+    }
+    
+    with st.chat_message("assistant"):
+        response = ask_dr_xas(prompt, openai_key, context)
+        st.markdown(response)
+        st.session_state.messages.append({"role": "assistant", "content": response})
