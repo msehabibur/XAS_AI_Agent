@@ -328,4 +328,103 @@ if user_text:
     st.session_state.chat.append(("user", user_text))
 
     # Ensure we have a spectrum loaded
-    if "x" no
+    if "x" not in st.session_state or "y" not in st.session_state:
+        reply = "Please load a spectrum first (sidebar → **Randomly load a spectrum**)."
+        st.session_state.chat.append(("assistant", reply))
+        st.rerun()
+
+    intent = parse_user_intent(user_text)
+    x = st.session_state.x
+    y = st.session_state.y
+
+    # If user asked both, do both (nice behavior)
+    do_fit = intent["fit"]
+    do_fft = intent["fft"]
+    n_gauss = intent["n_gauss"] if intent["n_gauss"] is not None else default_gauss
+
+    outputs = []
+
+    if do_fit:
+        # Use sidebar smoothing window in peak finder
+        # (we pass it by temporarily patching the function behavior via parameter)
+        # Simple approach: just call fit; peak finder uses its own default.
+        fit_res = fit_gaussians_to_peak(x, y, n_gauss=n_gauss)
+
+        if "error" in fit_res:
+            outputs.append(f"❌ Gaussian fit failed: `{fit_res['error']}`")
+        else:
+            rmse = fit_res["rmse"]
+            params = fit_res["params"]
+
+            # Build a readable parameter table
+            rows = []
+            for i in range(0, len(params), 3):
+                rows.append({
+                    "Gaussian": f"G{i//3 + 1}",
+                    "Amplitude": float(params[i]),
+                    "Center": float(params[i+1]),
+                    "Sigma": float(params[i+2]),
+                })
+            ptab = pd.DataFrame(rows)
+
+            outputs.append(
+                f"✅ **Gaussian fit** on the first major peak using **{n_gauss}** Gaussian(s). "
+                f"RMSE (local window): **{rmse:.4g}**"
+            )
+
+            # Plot fit result
+            x_fit = fit_res["x_fit"]
+            y_fit = fit_res["y_fit"]
+            y_pred = fit_res["y_pred"]
+
+            st.session_state.last_fit_plot = pd.DataFrame({
+                "Energy (fit window)": x_fit,
+                "Measured": y_fit,
+                "Fit": y_pred
+            })
+            st.session_state.last_fit_table = ptab
+
+    if do_fft:
+        xu, yu, freq, mag = compute_fft(x, y, n=int(fft_n), detrend=True, window=True)
+
+        outputs.append(
+            f"✅ **Fourier transform (FFT)** computed after interpolating to **{fft_n}** uniform points "
+            f"(mean-removed + Hann window)."
+        )
+
+        # Store for plotting
+        st.session_state.last_fft_time = pd.DataFrame({"Energy (uniform)": xu, "Signal": yu})
+        st.session_state.last_fft_freq = pd.DataFrame({"Frequency (1/eV)": freq, "Magnitude": mag})
+
+    if not do_fit and not do_fft:
+        outputs.append(
+            "I can do two things based on your prompt:\n"
+            "- **Gaussian fit** of the *first major peak* (say: “fit first peak with 2 gaussians”)\n"
+            "- **Fourier transform** (say: “do Fourier transform” or “FFT”)."
+        )
+
+    st.session_state.chat.append(("assistant", "\n\n".join(outputs)))
+    st.rerun()
+
+# Show analysis outputs
+st.divider()
+st.subheader("Outputs")
+
+out1, out2 = st.columns(2)
+
+with out1:
+    st.markdown("### Peak Fit")
+    if "last_fit_plot" in st.session_state:
+        st.line_chart(st.session_state.last_fit_plot, x="Energy (fit window)", height=300)
+        st.dataframe(st.session_state.last_fit_table, use_container_width=True)
+    else:
+        st.caption("No fit yet.")
+
+with out2:
+    st.markdown("### Fourier Transform")
+    if "last_fft_freq" in st.session_state:
+        st.line_chart(st.session_state.last_fft_freq, x="Frequency (1/eV)", y="Magnitude", height=300)
+        with st.expander("Show pre-FFT (uniform-grid) signal"):
+            st.line_chart(st.session_state.last_fft_time, x="Energy (uniform)", y="Signal", height=220)
+    else:
+        st.caption("No FFT yet.")
