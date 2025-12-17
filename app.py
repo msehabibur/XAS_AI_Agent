@@ -1,248 +1,117 @@
-import os
-import json
-import random
-import re
-import numpy as np
-import pandas as pd
 import streamlit as st
-
-from scipy.signal import find_peaks
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
 from scipy.optimize import curve_fit
 from openai import OpenAI
 
-# ============================================================
-# Streamlit setup
-# ============================================================
+# --- 1. CONFIGURATION & UI SETUP ---
 st.set_page_config(page_title="Dr. XAS AI Agent", layout="wide")
-st.title("🧪 Dr. XAS AI Agent")
 
-# ============================================================
-# Utilities: spectrum loading
-# ============================================================
-SUPPORTED_EXTS = (".csv", ".txt", ".dat")
-
-def list_spectra_files(folder):
-    files = []
-    for root, _, names in os.walk(folder):
-        for n in names:
-            if n.lower().endswith(SUPPORTED_EXTS):
-                files.append(os.path.join(root, n))
-    return sorted(files)
-
-def load_spectrum(path):
-    try:
-        df = pd.read_csv(path)
-        if df.shape[1] >= 2:
-            x = pd.to_numeric(df.iloc[:, 0], errors="coerce").to_numpy()
-            y = pd.to_numeric(df.iloc[:, 1], errors="coerce").to_numpy()
-    except Exception:
-        arr = np.loadtxt(path)
-        x, y = arr[:, 0], arr[:, 1]
-
-    mask = np.isfinite(x) & np.isfinite(y)
-    return x[mask], y[mask]
-
-# ============================================================
-# Signal processing helpers
-# ============================================================
-def smooth(y, w=11):
-    w = max(3, int(w) | 1)
-    return np.convolve(y, np.ones(w)/w, mode="same")
-
-# ============================================================
-# Gaussian fitting
-# ============================================================
-def gaussian(x, a, x0, s):
-    return a * np.exp(-0.5 * ((x - x0) / s) ** 2)
-
-def multi_gaussian(x, *p):
-    y = np.zeros_like(x)
-    for i in range(0, len(p), 3):
-        y += gaussian(x, p[i], p[i+1], p[i+2])
-    return y
-
-def fit_first_peak(x, y, n_gauss=1):
-    ys = smooth(y, 11)
-    peaks, _ = find_peaks(ys, prominence=0.05*(ys.max()-ys.min()))
-    pk = peaks[0] if len(peaks) else np.argmax(ys)
-
-    span = (x.max() - x.min()) * 0.05
-    mask = (x > x[pk]-span) & (x < x[pk]+span)
-
-    xfit, yfit = x[mask], y[mask]
-    base = yfit.min()
-    yfit = yfit - base
-
-    p0 = []
-    for i in range(n_gauss):
-        p0 += [yfit.max()/n_gauss, x[pk], span/5]
-
-    popt, _ = curve_fit(multi_gaussian, xfit, yfit, p0=p0, maxfev=20000)
-    ypred = multi_gaussian(xfit, *popt) + base
-
-    return xfit, yfit + base, ypred, popt
-
-# ============================================================
-# Fourier transform
-# ============================================================
-def compute_fft(x, y, n=4096):
-    xu = np.linspace(x.min(), x.max(), n)
-    yu = np.interp(xu, x, y)
-    yu -= yu.mean()
-
-    Y = np.fft.rfft(yu * np.hanning(len(yu)))
-    freq = np.fft.rfftfreq(len(yu), xu[1]-xu[0])
-    return freq, np.abs(Y)
-
-# ============================================================
-# GPT ROUTER
-# ============================================================
-ROUTER_SCHEMA = {
-    "name": "xas_router",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "action": {"type": "string", "enum": ["fit", "fft", "both", "none"]},
-            "n_gauss": {"type": "integer", "minimum": 1, "maximum": 4},
-            "explanation": {"type": "string"}
-        },
-        "required": ["action", "n_gauss", "explanation"]
-    }
-}
-
-def gpt_route(prompt, model, api_key):
-    client = OpenAI(api_key="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")
-    resp = client.responses.create(
-        model=model,
-        input=[
-            {"role": "developer", "content":
-             "You are Dr. XAS AI Agent. Decide analysis task for XAS data."},
-            {"role": "user", "content": prompt},
-        ],
-        text={
-            "format": {
-                "type": "json_schema",
-                "json_schema": ROUTER_SCHEMA,
-                "strict": True
-            }
-        },
-    )
-    return json.loads(resp.output_text)
-
-# ============================================================
-# Sidebar
-# ============================================================
+# Sidebar for Logo and API Key
 with st.sidebar:
-    st.header("Settings")
-
-    data_dir = st.text_input("Spectra folder", "data")
-    files = list_spectra_files(data_dir)
-    st.write(f"📁 {len(files)} spectra found")
-
-    if st.button("🎲 Load random spectrum"):
-        if files:
-            path = random.choice(files)
-            st.session_state["x"], st.session_state["y"] = load_spectrum(path)
-            st.session_state["path"] = path
-
+    st.image("drxas_logo_big.png", use_container_width=True)
+    st.title("Dr. XAS Controls")
+    api_key = st.text_input("OpenAI API Key", type="password", help="Enter your key to enable AI features")
     st.divider()
-    use_gpt = st.toggle("Use GPT routing", value=True)
-    api_key_input = st.text_input("OpenAI API key", type="password")
-    model_name = st.text_input("Model", "gpt-4o-mini")
+    st.info("Tasks: \n1. Gaussian Fitting\n2. Fourier Transform")
 
-# ============================================================
-# Chat
-# ============================================================
-if "chat" not in st.session_state:
-    st.session_state.chat = []
+# Initialize OpenAI Client
+client = OpenAI(api_key=api_key) if api_key else None
 
-left, right = st.columns([1.1, 0.9])
+# --- 2. DATA PROCESSING FUNCTIONS ---
+def gaussian(x, amp, cen, wid):
+    """Simple Gaussian function: A * exp(-(x-xc)^2 / (2*w^2))"""
+    return amp * np.exp(-(x - cen)**2 / (2 * wid**2))
 
-with left:
-    st.subheader("Spectrum")
-    if "x" in st.session_state:
-        df = pd.DataFrame({"Energy": st.session_state.x, "Mu": st.session_state.y})
-        st.line_chart(df, x="Energy", y="Mu", height=320)
-        st.caption(st.session_state.path)
+def perform_gaussian_fit(x, y):
+    """Performs a fit on the first major peak."""
+    peak_idx = np.argmax(y)  # Finds the highest point as the first major peak
+    initial_guess = [y[peak_idx], x[peak_idx], 1.0] # [amp, center, width]
+    popt, _ = curve_fit(gaussian, x, y, p0=initial_guess)
+    return popt
+
+def perform_fourier_transform(y):
+    """Performs a basic Fast Fourier Transform (FFT)."""
+    yf = np.fft.fft(y)
+    return np.abs(yf[:len(yf)//2])
+
+# --- 3. SESSION STATE & DATA LOADING ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Mock data loader (Replace with your actual database reading logic)
+@st.cache_data
+def load_data():
+    # Example: Generating synthetic XAS-like data
+    x = np.linspace(7100, 7200, 300)
+    # Background + Edge + Peak
+    y = 0.5 + 0.5 * np.tanh((x - 7115)/5) + 1.2 * np.exp(-(x - 7125)**2 / 10)
+    return pd.DataFrame({"Energy": x, "Intensity": y})
+
+df = load_data()
+
+# --- 4. CHAT INTERFACE & LOGIC ---
+st.title("Dr. XAS AI Agent 🔬")
+
+# Display conversation history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if "fig" in message:
+            st.plotly_chart(message["fig"])
+
+# User Input
+if prompt := st.chat_input("Ask Dr. XAS (e.g., 'Fit the peak' or 'Do a Fourier transform')"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    if not client:
+        st.warning("Please provide an OpenAI API Key in the sidebar.")
     else:
-        st.info("Load a spectrum first")
+        # AI Logic: Determine if user wants a Fit or FFT
+        response_text = ""
+        fig = None
+        
+        # Simple keyword routing (could be replaced with a system prompt for intent classification)
+        low_prompt = prompt.lower()
+        
+        with st.chat_message("assistant"):
+            if "fit" in low_prompt or "gaussian" in low_prompt:
+                popt = perform_gaussian_fit(df["Energy"].values, df["Intensity"].values)
+                amp, cen, wid = popt
+                
+                # Visualization
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=df["Energy"], y=df["Intensity"], name="Original Data"))
+                fig.add_trace(go.Scatter(x=df["Energy"], y=gaussian(df["Energy"], *popt), name="Gaussian Fit", line=dict(color='red', dash='dash')))
+                fig.update_layout(title="Peak Fitting Results", xaxis_title="Energy (eV)", ydata_title="Intensity")
+                st.plotly_chart(fig)
+                
+                response_text = f"I've completed the Gaussian fit on the first major peak. \n\n**Parameters:**\n- Position: {cen:.2f} eV\n- Amplitude: {amp:.2f}\n- Width: {wid:.2f}"
+                st.markdown(response_text)
 
-with right:
-    st.subheader("Chat")
-    for r, m in st.session_state.chat:
-        with st.chat_message(r):
-            st.markdown(m)
+            elif "fourier" in low_prompt or "transform" in low_prompt:
+                mag = perform_fourier_transform(df["Intensity"].values)
+                fig = go.Figure(data=go.Scatter(y=mag, name="FFT Magnitude"))
+                fig.update_layout(title="Fourier Transform (R-space)", xaxis_title="Index", yaxis_title="Magnitude")
+                st.plotly_chart(fig)
+                
+                response_text = "I have performed the Fourier transform of the spectrum. You can see the periodicity/scattering path contributions in the R-space plot above."
+                st.markdown(response_text)
+            
+            else:
+                # Regular Chat fallback
+                completion = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role": "system", "content": "You are Dr. XAS, an expert in X-ray absorption spectroscopy."}] + 
+                             [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
+                )
+                response_text = completion.choices[0].message.content
+                st.markdown(response_text)
 
-    user_msg = st.chat_input("e.g. 'Fit first peak with 2 Gaussians'")
-
-# ============================================================
-# Handle user message
-# ============================================================
-if user_msg:
-    st.session_state.chat.append(("user", user_msg))
-
-    if "x" not in st.session_state:
-        st.session_state.chat.append(("assistant", "Please load a spectrum first."))
-        st.rerun()
-
-    # GPT or fallback routing
-    try:
-        if use_gpt:
-            key = api_key_input or os.getenv("OPENAI_API_KEY")
-            route = gpt_route(user_msg, model_name, key)
-            action = route["action"]
-            n_gauss = route["n_gauss"]
-            note = f"🧠 GPT: {route['explanation']}"
-        else:
-            raise RuntimeError("GPT disabled")
-
-    except Exception as e:
-        txt = user_msg.lower()
-        action = "fit" if "fit" in txt else "fft" if "fft" in txt else "none"
-        n_gauss = 2 if "two" in txt or "2" in txt else 1
-        note = f"⚠️ Local fallback routing ({e})"
-
-    outputs = [note]
-
-    x, y = st.session_state.x, st.session_state.y
-
-    if action in ["fit", "both"]:
-        xfit, yfit, ypred, params = fit_first_peak(x, y, n_gauss)
-        df_fit = pd.DataFrame({"Energy": xfit, "Data": yfit, "Fit": ypred})
-        st.session_state["fit_plot"] = df_fit
-        outputs.append(f"Gaussian fit done with {n_gauss} Gaussian(s).")
-
-    if action in ["fft", "both"]:
-        freq, mag = compute_fft(x, y)
-        st.session_state["fft_plot"] = pd.DataFrame(
-            {"Frequency": freq, "Magnitude": mag}
-        )
-        outputs.append("Fourier transform completed.")
-
-    if action == "none":
-        outputs.append("I can do Gaussian fitting or Fourier transform.")
-
-    st.session_state.chat.append(("assistant", "\n\n".join(outputs)))
-    st.rerun()
-
-# ============================================================
-# Output plots
-# ============================================================
-st.divider()
-st.subheader("Results")
-
-c1, c2 = st.columns(2)
-
-with c1:
-    st.markdown("### Peak Fit")
-    if "fit_plot" in st.session_state:
-        st.line_chart(st.session_state.fit_plot, x="Energy")
-    else:
-        st.caption("No fit yet")
-
-with c2:
-    st.markdown("### Fourier Transform")
-    if "fft_plot" in st.session_state:
-        st.line_chart(st.session_state.fft_plot, x="Frequency", y="Magnitude")
-    else:
-        st.caption("No FFT yet")
+        # Save to memory
+        msg_data = {"role": "assistant", "content": response_text}
+        if fig: msg_data["fig"] = fig
+        st.session_state.messages.append(msg_data)
