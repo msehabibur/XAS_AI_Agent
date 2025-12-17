@@ -4,3 +4,5 @@ pandas
 scipy
 openai
 matplotlib
+ase 
+st-py3mol
