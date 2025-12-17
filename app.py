@@ -1,117 +1,112 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from openai import OpenAI
 
-# --- 1. CONFIGURATION & UI SETUP ---
+# --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Dr. XAS AI Agent", layout="wide")
 
-# Sidebar for Logo and API Key
+# Sidebar for Logo and API
 with st.sidebar:
-    st.image("drxas_logo_big.png", use_container_width=True)
-    st.title("Dr. XAS Controls")
-    api_key = st.text_input("OpenAI API Key", type="password", help="Enter your key to enable AI features")
+    try:
+        st.image("drxas_logo_big.png", use_container_width=True)
+    except:
+        st.warning("Logo file 'drxas_logo_big.png' not found.")
+    
+    st.title("Control Panel")
+    api_key = st.text_input("OpenAI API Key", type="password")
+    client = OpenAI(api_key=api_key) if api_key else None
+    
     st.divider()
-    st.info("Tasks: \n1. Gaussian Fitting\n2. Fourier Transform")
+    st.write("**Database Status:**")
+    try:
+        # Assuming your CSV has columns 'energy' and 'intensity'
+        df = pd.read_csv("xas_data.csv")
+        st.success("xas_data.csv loaded successfully!")
+    except FileNotFoundError:
+        st.error("xas_data.csv not found. Using dummy data for now.")
+        x = np.linspace(7000, 7200, 500)
+        y = np.exp(-(x - 7120)**2 / 40) + 0.5 * np.exp(-(x - 7150)**2 / 100) + 0.1 * np.random.normal(size=500)
+        df = pd.DataFrame({"energy": x, "intensity": y})
 
-# Initialize OpenAI Client
-client = OpenAI(api_key=api_key) if api_key else None
-
-# --- 2. DATA PROCESSING FUNCTIONS ---
+# --- 2. MATH FUNCTIONS ---
 def gaussian(x, amp, cen, wid):
-    """Simple Gaussian function: A * exp(-(x-xc)^2 / (2*w^2))"""
     return amp * np.exp(-(x - cen)**2 / (2 * wid**2))
 
-def perform_gaussian_fit(x, y):
-    """Performs a fit on the first major peak."""
-    peak_idx = np.argmax(y)  # Finds the highest point as the first major peak
-    initial_guess = [y[peak_idx], x[peak_idx], 1.0] # [amp, center, width]
-    popt, _ = curve_fit(gaussian, x, y, p0=initial_guess)
+def perform_fit(x, y):
+    # Initial guess: max height, x-coord of max height, and a standard width
+    peak_idx = np.argmax(y)
+    p0 = [max(y), x[peak_idx], 1.0]
+    popt, _ = curve_fit(gaussian, x, y, p0=p0)
     return popt
 
-def perform_fourier_transform(y):
-    """Performs a basic Fast Fourier Transform (FFT)."""
-    yf = np.fft.fft(y)
-    return np.abs(yf[:len(yf)//2])
-
-# --- 3. SESSION STATE & DATA LOADING ---
+# --- 3. CHAT INTERFACE & MEMORY ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Mock data loader (Replace with your actual database reading logic)
-@st.cache_data
-def load_data():
-    # Example: Generating synthetic XAS-like data
-    x = np.linspace(7100, 7200, 300)
-    # Background + Edge + Peak
-    y = 0.5 + 0.5 * np.tanh((x - 7115)/5) + 1.2 * np.exp(-(x - 7125)**2 / 10)
-    return pd.DataFrame({"Energy": x, "Intensity": y})
+st.title("Dr. XAS AI Agent")
 
-df = load_data()
-
-# --- 4. CHAT INTERFACE & LOGIC ---
-st.title("Dr. XAS AI Agent 🔬")
-
-# Display conversation history
+# Display historical messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
-        if "fig" in message:
-            st.plotly_chart(message["fig"])
+        if "plot" in message:
+            st.pyplot(message["plot"])
 
-# User Input
-if prompt := st.chat_input("Ask Dr. XAS (e.g., 'Fit the peak' or 'Do a Fourier transform')"):
+# User prompt
+if prompt := st.chat_input("How can I help with your XAS data?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
     if not client:
-        st.warning("Please provide an OpenAI API Key in the sidebar.")
+        st.error("Please enter your OpenAI API Key in the sidebar to proceed.")
     else:
-        # AI Logic: Determine if user wants a Fit or FFT
-        response_text = ""
-        fig = None
-        
-        # Simple keyword routing (could be replaced with a system prompt for intent classification)
-        low_prompt = prompt.lower()
-        
         with st.chat_message("assistant"):
-            if "fit" in low_prompt or "gaussian" in low_prompt:
-                popt = perform_gaussian_fit(df["Energy"].values, df["Intensity"].values)
-                amp, cen, wid = popt
-                
-                # Visualization
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=df["Energy"], y=df["Intensity"], name="Original Data"))
-                fig.add_trace(go.Scatter(x=df["Energy"], y=gaussian(df["Energy"], *popt), name="Gaussian Fit", line=dict(color='red', dash='dash')))
-                fig.update_layout(title="Peak Fitting Results", xaxis_title="Energy (eV)", ydata_title="Intensity")
-                st.plotly_chart(fig)
-                
-                response_text = f"I've completed the Gaussian fit on the first major peak. \n\n**Parameters:**\n- Position: {cen:.2f} eV\n- Amplitude: {amp:.2f}\n- Width: {wid:.2f}"
-                st.markdown(response_text)
-
-            elif "fourier" in low_prompt or "transform" in low_prompt:
-                mag = perform_fourier_transform(df["Intensity"].values)
-                fig = go.Figure(data=go.Scatter(y=mag, name="FFT Magnitude"))
-                fig.update_layout(title="Fourier Transform (R-space)", xaxis_title="Index", yaxis_title="Magnitude")
-                st.plotly_chart(fig)
-                
-                response_text = "I have performed the Fourier transform of the spectrum. You can see the periodicity/scattering path contributions in the R-space plot above."
-                st.markdown(response_text)
+            low_prompt = prompt.lower()
+            fig, ax = plt.subplots(figsize=(8, 4))
             
-            else:
-                # Regular Chat fallback
-                completion = client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[{"role": "system", "content": "You are Dr. XAS, an expert in X-ray absorption spectroscopy."}] + 
-                             [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
-                )
-                response_text = completion.choices[0].message.content
-                st.markdown(response_text)
+            # TASK: GAUSSIAN FITTING
+            if "fit" in low_prompt or "gaussian" in low_prompt:
+                x_val, y_val = df["energy"].values, df["intensity"].values
+                popt = perform_fit(x_val, y_val)
+                
+                ax.plot(x_val, y_val, 'k-', label='Original Data', alpha=0.7)
+                ax.plot(x_val, gaussian(x_val, *popt), 'r--', label='Gaussian Fit')
+                ax.set_title("XAS Peak Fitting")
+                ax.set_xlabel("Energy (eV)")
+                ax.set_ylabel("Intensity")
+                ax.legend()
+                st.pyplot(fig)
+                
+                res_text = (f"I've performed a Gaussian fit on the primary peak.\n\n"
+                            f"**Parameters:**\n- Position: {popt[1]:.2f}\n- Amplitude: {popt[0]:.2f}\n- Width: {popt[2]:.2f}")
+                st.markdown(res_text)
+                st.session_state.messages.append({"role": "assistant", "content": res_text, "plot": fig})
 
-        # Save to memory
-        msg_data = {"role": "assistant", "content": response_text}
-        if fig: msg_data["fig"] = fig
-        st.session_state.messages.append(msg_data)
+            # TASK: FOURIER TRANSFORM
+            elif "fourier" in low_prompt or "transform" in low_prompt:
+                y_val = df["intensity"].values
+                fft_res = np.abs(np.fft.fft(y_val))[:len(y_val)//2]
+                
+                ax.plot(fft_res, color='blue')
+                ax.set_title("Fourier Transform (R-space Magnitude)")
+                ax.set_xlabel("k (approx)")
+                ax.set_ylabel("|FT|")
+                st.pyplot(fig)
+                
+                res_text = "Fourier Transform complete. The plot above shows the magnitude in R-space."
+                st.markdown(res_text)
+                st.session_state.messages.append({"role": "assistant", "content": res_text, "plot": fig})
+
+            # TASK: GENERAL CHAT (Memory included)
+            else:
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
+                )
+                res_text = response.choices[0].message.content
+                st.markdown(res_text)
+                st.session_state.messages.append({"role": "assistant", "content": res_text})
