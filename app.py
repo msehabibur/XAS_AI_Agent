@@ -23,7 +23,7 @@ with st.sidebar:
     st.write("**Database Status:**")
     try:
         # Assuming your CSV has columns 'energy' and 'intensity'
-        df = pd.read_csv("xas_data.csv")
+        df = pd.read_csv("XAS_database.txt")
         st.success("xas_data.csv loaded successfully!")
     except FileNotFoundError:
         st.error("xas_data.csv not found. Using dummy data for now.")
